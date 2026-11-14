@@ -1,74 +1,82 @@
-// Entrypoint: bind ephemeral port, register with the suite, serve until done, exit 0.
-// ForgeTS: High-performance GitHub-compatible git forge (Smart HTTP v2, REST v3, GraphQL v4, MCP)
+// Forge entrypoint: start HTTP server, bind listening port, register with harness, wait for completion.
 import http from 'node:http'
 import { createForgeServer } from './src/httpd.ts'
 import { Store } from './src/store.ts'
 
-const store = new Store()
-const server = createForgeServer(store)
-const bindPort = Number(process.env.PORT) || 0
+const forgeState = new Store()
+const forgeHttpApp = createForgeServer(forgeState)
+const targetPort = process.env.PORT ? parseInt(process.env.PORT, 10) : 0
 
-server.listen(bindPort, '0.0.0.0', () => {
-  const addr = server.address()
-  const port = typeof addr === 'object' && addr ? addr.port : 0
-  if (port === 0) {
-    console.error('failed to bind an ephemeral port')
+forgeHttpApp.listen(targetPort, '0.0.0.0', () => {
+  const addressInfo = forgeHttpApp.address()
+  const activePort = typeof addressInfo === 'object' && addressInfo !== null ? addressInfo.port : 0
+  if (activePort <= 0) {
+    console.error('Fatal: unable to acquire valid listening port')
     process.exit(1)
   }
-  console.log(`forge listening on port ${port}`)
-  const envUrl = process.env.MAKEFUN_ENV_URL
-  if (!envUrl) {
-    // local mode: run until terminated
+  console.log(`[forge] daemon online, port=${activePort}`)
+  const harnessEndpoint = process.env.MAKEFUN_ENV_URL
+  if (!harnessEndpoint) {
     return
   }
-  register(envUrl, port)
+  executeHarnessRegistration(harnessEndpoint, activePort)
 })
 
-function register(envUrl: string, port: number): void {
-  const base = envUrl.replace(/\/$/, '')
-  const attempt = async (): Promise<void> => {
+function executeHarnessRegistration(harnessUrl: string, boundPort: number): void {
+  const normalizedBase = harnessUrl.replace(/\/+$/, '')
+  const dispatch = async (): Promise<void> => {
     try {
-      const res = await fetch(`${base}/register`, {
+      const response = await fetch(`${normalizedBase}/register`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ port }),
+        body: JSON.stringify({ port: boundPort }),
       })
-      if (res.ok) {
-        console.log('registered with suite')
-        await pollDone(base)
+      if (response.ok) {
+        console.log('[forge] successfully registered with evaluation suite')
+        await monitorSuiteCompletion(normalizedBase)
         return
       }
     } catch {
-      // suite not ready yet; retry
+      // Suite listener not ready; retry connection
     }
-    setTimeout(() => void attempt(), 200)
+    setTimeout(() => void dispatch(), 200)
   }
-  void attempt()
+  void dispatch()
 }
 
-async function pollDone(base: string): Promise<void> {
+async function monitorSuiteCompletion(normalizedBase: string): Promise<void> {
   for (;;) {
     try {
-      const res = await fetch(`${base}/done`)
-      const text = await res.text()
-      let done = false
+      const checkRes = await fetch(`${normalizedBase}/done`)
+      const payload = await checkRes.text()
+      let isDone = false
       try {
-        done = JSON.parse(text)?.done === true
+        const parsed = JSON.parse(payload) as { done?: boolean }
+        isDone = parsed?.done === true
       } catch {
-        done = false
+        isDone = false
       }
-      if (done) {
-        console.log('suite done; exiting')
-        server.close()
+      if (isDone) {
+        console.log('[forge] test run finished; shutting down')
+        forgeHttpApp.close()
         process.exit(0)
         return
       }
     } catch {
-      // keep polling
+      // Continue polling until done
     }
-    await new Promise((r) => setTimeout(r, 250))
+    await new Promise((resolve) => setTimeout(resolve, 250))
   }
 }
 
-process.on('SIGTERM', () => { server.close(); process.exit(0) })
-process.on('SIGINT', () => { server.close(); process.exit(0) })
+process.on('SIGTERM', () => {
+  forgeHttpApp.close()
+  process.exit(0)
+})
+
+process.on('SIGINT', () => {
+  forgeHttpApp.close()
+  process.exit(0)
+})
+
+export { forgeHttpApp, forgeState }

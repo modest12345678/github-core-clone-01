@@ -1,4 +1,4 @@
-// HTTP plumbing: routing, auth, body collection, top-level error handling.
+// HTTP dispatch plumbing: request body buffering, content negotiation, authentication gate, and API routing.
 import http from 'node:http'
 import zlib from 'node:zlib'
 import { Store } from './store.ts'
@@ -7,166 +7,206 @@ import { handleGraphQL } from './graphql.ts'
 import { handleMcp } from './mcp.ts'
 import { handleGit } from './smarthttp.ts'
 
-function collectBody(req: http.IncomingMessage, limit = 512 * 1024 * 1024): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = []
-    let size = 0
-    req.on('data', (c: Buffer) => {
-      size += c.length
-      if (size > limit) {
-        reject(new Error('body too large'))
-        req.destroy()
+function readIncomingBody(inStream: http.IncomingMessage, byteCap = 512 * 1024 * 1024): Promise<Buffer> {
+  return new Promise((fulfill, reject) => {
+    const streamChunks: Buffer[] = []
+    let totalBytesRead = 0
+    inStream.on('data', (dataChunk: Buffer) => {
+      totalBytesRead += dataChunk.length
+      if (totalBytesRead > byteCap) {
+        reject(new Error('Payload exceeds maximum allowed size'))
+        inStream.destroy()
         return
       }
-      chunks.push(c)
+      streamChunks.push(dataChunk)
     })
-    req.on('end', () => resolve(Buffer.concat(chunks)))
-    req.on('error', reject)
+    inStream.on('end', () => fulfill(Buffer.concat(streamChunks)))
+    inStream.on('error', reject)
   })
 }
 
-export function createForgeServer(store: Store): http.Server {
-  const server = http.createServer((req, res) => {
-    void handleRequest(store, req, res)
+export function createForgeServer(dataStore: Store): http.Server {
+  const forgeApp = http.createServer((clientReq, clientRes) => {
+    void processClientRequest(dataStore, clientReq, clientRes)
   })
-  server.on('checkContinue', (req, res) => {
-    res.writeContinue()
-    void handleRequest(store, req, res)
+  forgeApp.on('checkContinue', (clientReq, clientRes) => {
+    clientRes.writeContinue()
+    void processClientRequest(dataStore, clientReq, clientRes)
   })
-  server.keepAliveTimeout = 65_000
-  server.requestTimeout = 0
-  server.headersTimeout = 60_000
-  return server
+  forgeApp.keepAliveTimeout = 65_000
+  forgeApp.requestTimeout = 0
+  forgeApp.headersTimeout = 60_000
+  return forgeApp
 }
 
-async function handleRequest(store: Store, req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+async function processClientRequest(
+  dataStore: Store,
+  incomingReq: http.IncomingMessage,
+  outgoingRes: http.ServerResponse,
+): Promise<void> {
   try {
-    const url = new URL(req.url ?? '/', 'http://localhost')
-    const pathname = url.pathname
-    let raw: Buffer | null = null
-    if (req.method !== 'GET' && req.method !== 'HEAD') {
-      raw = await collectBody(req)
-      const enc = String(req.headers['content-encoding'] ?? '').toLowerCase()
-      if (enc.includes('gzip') && raw.length > 0) {
+    const parsedUrl = new URL(incomingReq.url ?? '/', 'http://localhost')
+    const requestPath = parsedUrl.pathname
+    let bodyBuffer: Buffer | null = null
+    if (incomingReq.method !== 'GET' && incomingReq.method !== 'HEAD') {
+      bodyBuffer = await readIncomingBody(incomingReq)
+      const contentEncodingHeader = String(incomingReq.headers['content-encoding'] ?? '').toLowerCase()
+      if (contentEncodingHeader.includes('gzip') && bodyBuffer.length > 0) {
         try {
-          raw = zlib.gunzipSync(raw)
+          bodyBuffer = zlib.gunzipSync(bodyBuffer)
         } catch {
-          sendPlain(res, 400, { message: 'Problems parsing JSON' })
+          sendJsonResponse(outgoingRes, 400, { message: 'Problems parsing JSON' })
           return
         }
       }
     } else {
-      raw = Buffer.alloc(0)
+      bodyBuffer = Buffer.alloc(0)
     }
 
     // Health probe (env boot check: 200 {"ok":true})
-    if (pathname === '/healthz' && (req.method === 'GET' || req.method === 'HEAD')) {
-      const body = Buffer.from(JSON.stringify({ ok: true }) + '\n', 'utf8')
-      res.writeHead(200, {
+    if (requestPath === '/healthz' && (incomingReq.method === 'GET' || incomingReq.method === 'HEAD')) {
+      const healthPayload = Buffer.from(JSON.stringify({ ok: true }) + '\n', 'utf8')
+      outgoingRes.writeHead(200, {
         'Content-Type': 'application/json; charset=utf-8',
-        'Content-Length': String(body.length),
+        'Content-Length': String(healthPayload.length),
       })
-      res.end(body)
+      outgoingRes.end(healthPayload)
       return
     }
 
-    // MCP endpoint (before git fallback)
-    if (pathname === '/mcp') {
-      const auth = String(req.headers.authorization ?? '')
-      const bearer = auth.startsWith('Bearer ') ? auth.slice(7).trim() : null
-      const token = process.env.MAKEFUN_SHOP_TOKEN
-      const authed = bearer !== null && bearer.length > 0 && (token === undefined || token === '' || bearer === token)
-      if (!authed) {
-        sendPlain(res, 401, { message: 'Requires authentication' })
+    // Model Context Protocol (MCP) stream endpoint
+    if (requestPath === '/mcp') {
+      const authHeaderStr = String(incomingReq.headers.authorization ?? '')
+      const bearerTokenVal = authHeaderStr.startsWith('Bearer ') ? authHeaderStr.slice(7).trim() : null
+      const expectedToken = process.env.MAKEFUN_SHOP_TOKEN
+      const isAuthorized =
+        bearerTokenVal !== null &&
+        bearerTokenVal.length > 0 &&
+        (expectedToken === undefined || expectedToken === '' || bearerTokenVal === expectedToken)
+      if (!isAuthorized) {
+        sendJsonResponse(outgoingRes, 401, { message: 'Requires authentication' })
         return
       }
-      if (req.method !== 'POST') {
-        sendPlain(res, 405, { message: 'method not allowed' })
+      if (incomingReq.method !== 'POST') {
+        sendJsonResponse(outgoingRes, 405, { message: 'method not allowed' })
         return
       }
-      const sessionId = typeof req.headers['mcp-session-id'] === 'string' ? (req.headers['mcp-session-id'] as string) : null
-      handleMcp(store, raw.toString('utf8'), res, sessionId, (status, body, sid) => {
-        const headers: Record<string, string> = { 'Content-Length': String(body.length) }
-        if (body.length > 0) headers['Content-Type'] = 'application/json'
-        if (sid) headers['Mcp-Session-Id'] = sid
-        res.writeHead(status, headers)
-        res.end(body)
+      const activeSessionId =
+        typeof incomingReq.headers['mcp-session-id'] === 'string'
+          ? (incomingReq.headers['mcp-session-id'] as string)
+          : null
+      handleMcp(dataStore, bodyBuffer.toString('utf8'), outgoingRes, activeSessionId, (statusCode, replyBody, sid) => {
+        const replyHeaders: Record<string, string> = { 'Content-Length': String(replyBody.length) }
+        if (replyBody.length > 0) replyHeaders['Content-Type'] = 'application/json'
+        if (sid) replyHeaders['Mcp-Session-Id'] = sid
+        outgoingRes.writeHead(statusCode, replyHeaders)
+        outgoingRes.end(replyBody)
       })
       return
     }
 
-    // git smart HTTP: no auth required
-    if (!pathname.startsWith('/api/')) {
-      const isGit = pathname.endsWith('.git/info/refs') || pathname.endsWith('.git/git-upload-pack') || pathname.endsWith('.git/git-receive-pack') || pathname.includes('.git/')
-      if (isGit || /^\/[^/]+\/[^/]+\.git(\/|$)/.test(pathname)) {
-        const handled = handleGit(store, req.method ?? 'GET', pathname, url.searchParams, req.headers, raw, res)
-        if (handled) return
+    // Git Smart HTTP transport routing: public access
+    if (!requestPath.startsWith('/api/')) {
+      const hasGitSuffix =
+        requestPath.endsWith('.git/info/refs') ||
+        requestPath.endsWith('.git/git-upload-pack') ||
+        requestPath.endsWith('.git/git-receive-pack') ||
+        requestPath.includes('.git/')
+      if (hasGitSuffix || /^\/[^/]+\/[^/]+\.git(\/|$)/.test(requestPath)) {
+        const gitHandled = handleGit(
+          dataStore,
+          incomingReq.method ?? 'GET',
+          requestPath,
+          parsedUrl.searchParams,
+          incomingReq.headers,
+          bodyBuffer,
+          outgoingRes,
+        )
+        if (gitHandled) return
       }
-      sendPlain(res, 404, { message: 'Not Found' })
+      sendJsonResponse(outgoingRes, 404, { message: 'Not Found' })
       return
     }
 
-    // auth for API surfaces
-    const auth = String(req.headers.authorization ?? '')
-    const bearer = auth.startsWith('Bearer ') ? auth.slice(7).trim() : null
-    const token = process.env.MAKEFUN_SHOP_TOKEN
-    const authed = bearer !== null && bearer.length > 0 && (token === undefined || token === '' || bearer === token)
-    if (!authed) {
-      sendPlain(res, 401, { message: 'Requires authentication' })
+    // Authentication verification for REST and GraphQL surfaces
+    const authVal = String(incomingReq.headers.authorization ?? '')
+    const tokenCandidate = authVal.startsWith('Bearer ') ? authVal.slice(7).trim() : null
+    const targetToken = process.env.MAKEFUN_SHOP_TOKEN
+    const hasValidToken =
+      tokenCandidate !== null &&
+      tokenCandidate.length > 0 &&
+      (targetToken === undefined || targetToken === '' || tokenCandidate === targetToken)
+    if (!hasValidToken) {
+      sendJsonResponse(outgoingRes, 401, { message: 'Requires authentication' })
       return
     }
 
-    if (pathname === '/api/graphql') {
-      if (req.method !== 'POST') {
-        sendPlain(res, 404, { message: 'Not Found' })
+    if (requestPath === '/api/graphql') {
+      if (incomingReq.method !== 'POST') {
+        sendJsonResponse(outgoingRes, 404, { message: 'Not Found' })
         return
       }
-      handleGraphQL(store, raw.toString('utf8'), baseUrl(req), res)
+      handleGraphQL(dataStore, bodyBuffer.toString('utf8'), extractBaseUrl(incomingReq), outgoingRes)
       return
     }
 
-    if (pathname.startsWith('/api/v3')) {
-      const segs = pathname.slice('/api/v3'.length).split('/').filter((s) => s.length > 0)
-      let body: Record<string, unknown> | null = null
-      if (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH' || req.method === 'DELETE') {
-        const text = raw.toString('utf8').trim()
-        if (text.length > 0) {
+    if (requestPath.startsWith('/api/v3')) {
+      const pathSegs = requestPath.slice('/api/v3'.length).split('/').filter((s) => s.length > 0)
+      let parsedBodyJson: Record<string, unknown> | null = null
+      if (
+        incomingReq.method === 'POST' ||
+        incomingReq.method === 'PUT' ||
+        incomingReq.method === 'PATCH' ||
+        incomingReq.method === 'DELETE'
+      ) {
+        const bodyRawText = bodyBuffer.toString('utf8').trim()
+        if (bodyRawText.length > 0) {
           try {
-            body = JSON.parse(text) as Record<string, unknown>
-            if (body === null || typeof body !== 'object' || Array.isArray(body)) body = body as Record<string, unknown>
+            parsedBodyJson = JSON.parse(bodyRawText) as Record<string, unknown>
+            if (parsedBodyJson === null || typeof parsedBodyJson !== 'object' || Array.isArray(parsedBodyJson)) {
+              parsedBodyJson = parsedBodyJson as Record<string, unknown>
+            }
           } catch {
-            sendPlain(res, 400, { message: 'Problems parsing JSON' })
+            sendJsonResponse(outgoingRes, 400, { message: 'Problems parsing JSON' })
             return
           }
         }
       }
-      const handled = handleRest(store, req.method ?? 'GET', segs, url.searchParams, body, baseUrl(req), res)
-      if (handled) return
-      sendPlain(res, 404, { message: 'Not Found' })
+      const restHandled = handleRest(
+        dataStore,
+        incomingReq.method ?? 'GET',
+        pathSegs,
+        parsedUrl.searchParams,
+        parsedBodyJson,
+        extractBaseUrl(incomingReq),
+        outgoingRes,
+      )
+      if (restHandled) return
+      sendJsonResponse(outgoingRes, 404, { message: 'Not Found' })
       return
     }
 
-    sendPlain(res, 404, { message: 'Not Found' })
-  } catch (e) {
+    sendJsonResponse(outgoingRes, 404, { message: 'Not Found' })
+  } catch (err) {
     try {
-      sendPlain(res, 500, { message: `Internal Server Error: ${(e as Error).message}` })
+      sendJsonResponse(outgoingRes, 500, { message: `Internal Server Error: ${(err as Error).message}` })
     } catch {
-      // response already sent
+      // Stream already committed
     }
   }
 }
 
-function baseUrl(req: http.IncomingMessage): string {
-  const host = String(req.headers.host ?? 'localhost')
-  return `http://${host}`
+function extractBaseUrl(reqMsg: http.IncomingMessage): string {
+  const hostVal = String(reqMsg.headers.host ?? 'localhost')
+  return `http://${hostVal}`
 }
 
-function sendPlain(res: http.ServerResponse, status: number, obj: unknown): void {
-  const body = Buffer.from(JSON.stringify(obj), 'utf8')
-  res.writeHead(status, {
+function sendJsonResponse(resObj: http.ServerResponse, code: number, payloadObj: unknown): void {
+  const binaryPayload = Buffer.from(JSON.stringify(payloadObj), 'utf8')
+  resObj.writeHead(code, {
     'Content-Type': 'application/json; charset=utf-8',
     'X-GitHub-Request-Id': 'req-unknown',
-    'Content-Length': String(body.length),
+    'Content-Length': String(binaryPayload.length),
   })
-  res.end(body)
+  resObj.end(binaryPayload)
 }

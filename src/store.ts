@@ -1,10 +1,19 @@
-// Deterministic in-memory forge store: repos, refs, issues, PRs, labels, ids, clock.
-import { ObjectStore, EMPTY_TREE, makeCommit, serializeTree, treeClosure, updateTreePath, parseTree, isDirMode, type TreeEntry } from './objects.ts'
+// Deterministic in-memory database engine: state tree, repository metadata, refs, issues, PRs, and monotonic logical clock.
+import {
+  ObjectStore,
+  EMPTY_TREE,
+  makeCommit,
+  serializeTree,
+  treeClosure,
+  updateTreePath,
+  parseTree,
+  isDirMode,
+  type TreeEntry,
+} from './objects.ts'
 import type { ObjType } from './packfile.ts'
 
-// Logical clock: every mutating operation advances one tick, so two runs of the
-// same suite produce identical ids and timestamps byte for byte.
-const BASE_MS = 1767225600000 // 2026-01-01T00:00:00.000Z
+// Monotonic logical epoch base: 2026-01-01T00:00:00.000Z
+const BASE_TIMESTAMP_MS = 1767225600000
 
 export interface CommentRec {
   id: number
@@ -51,9 +60,9 @@ export interface LabelRec {
 }
 
 export class Repo {
-  owner: string
-  name: string
-  dbId: number
+  readonly owner: string
+  readonly name: string
+  readonly dbId: number
   description = ''
   defaultBranch = 'main'
   isPrivate = false
@@ -61,57 +70,59 @@ export class Repo {
   updatedAt: Date
   pushedAt: Date
   numSeq = 0
-  issues = new Map<number, IssueRec>()
-  pulls = new Map<number, PullRec>()
-  labels = new Map<string, LabelRec>()
-  refs = new Map<string, string>()
-  packCache = new Map<string, Buffer>()
+  readonly issues = new Map<number, IssueRec>()
+  readonly pulls = new Map<number, PullRec>()
+  readonly labels = new Map<string, LabelRec>()
+  readonly refs = new Map<string, string>()
+  readonly packCache = new Map<string, Buffer>()
 
-  constructor(owner: string, name: string, when: Date, dbId: number) {
-    this.owner = owner
-    this.name = name
-    this.createdAt = when
-    this.updatedAt = when
-    this.pushedAt = when
-    this.dbId = dbId
+  constructor(repoOwner: string, repoName: string, initDate: Date, databaseId: number) {
+    this.owner = repoOwner
+    this.name = repoName
+    this.createdAt = initDate
+    this.updatedAt = initDate
+    this.pushedAt = initDate
+    this.dbId = databaseId
   }
 
   get fullName(): string {
     return `${this.owner}/${this.name}`
   }
 
-  refSha(ref: string): string | null {
-    if (ref.startsWith('refs/')) return this.refs.get(ref) ?? null
+  refSha(refName: string): string | null {
+    if (refName.startsWith('refs/')) {
+      return this.refs.get(refName) ?? null
+    }
     return null
   }
 
-  branchSha(branch: string): string | null {
-    return this.refs.get(`refs/heads/${branch}`) ?? null
+  branchSha(branchIdentifier: string): string | null {
+    return this.refs.get(`refs/heads/${branchIdentifier}`) ?? null
   }
 
-  setRef(ref: string, sha: string): void {
-    this.refs.set(ref, sha)
+  setRef(referenceName: string, commitOid: string): void {
+    this.refs.set(referenceName, commitOid)
     this.packCache.clear()
   }
 
-  deleteRef(ref: string): void {
-    this.refs.delete(ref)
+  deleteRef(referenceName: string): void {
+    this.refs.delete(referenceName)
     this.packCache.clear()
   }
 }
 
 export class Store {
-  objects = new ObjectStore()
-  repos = new Map<string, Repo>()
-  clock = BASE_MS
+  readonly objects = new ObjectStore()
+  readonly repos = new Map<string, Repo>()
+  clock = BASE_TIMESTAMP_MS
   reqCounter = 0
   repoId = 1000
   issueId = 2000
   pullId = 3000
   labelId = 4000
   commentId = 5000
-  login = process.env.MAKEFUN_LOGIN || 'adaiversen'
-  nodes = new Map<string, { kind: 'Repository' | 'Issue' | 'PullRequest'; repo: Repo; id: number }>()
+  readonly login = process.env.MAKEFUN_LOGIN || 'adaiversen'
+  readonly nodes = new Map<string, { kind: 'Repository' | 'Issue' | 'PullRequest'; repo: Repo; id: number }>()
 
   tick(): Date {
     this.clock += 1000
@@ -128,184 +139,215 @@ export class Store {
     return `req-${this.reqCounter}`
   }
 
-  nodeId(kind: string, dbId: number): string {
-    return Buffer.from(`${kind}:${dbId}`, 'latin1').toString('base64')
+  nodeId(typeName: string, entityId: number): string {
+    return Buffer.from(`${typeName}:${entityId}`, 'latin1').toString('base64')
   }
 
-  getRepo(owner: string, name: string): Repo | null {
-    return this.repos.get(`${owner}/${name}`) ?? null
+  getRepo(userLogin: string, projectSlug: string): Repo | null {
+    return this.repos.get(`${userLogin}/${projectSlug}`) ?? null
   }
 
-  createRepo(name: string, description = '', isPrivate = false, when = this.tick()): Repo {
+  createRepo(
+    repoSlug: string,
+    descSummary = '',
+    privateVisibility = false,
+    creationTimestamp = this.tick(),
+  ): Repo {
     this.repoId += 1
-    const repo = new Repo(this.login, name, when, this.repoId)
-    repo.description = description
-    repo.isPrivate = isPrivate
-    this.repos.set(repo.fullName, repo)
-    return repo
+    const newRepoInstance = new Repo(this.login, repoSlug, creationTimestamp, this.repoId)
+    newRepoInstance.description = descSummary
+    newRepoInstance.isPrivate = privateVisibility
+    this.repos.set(newRepoInstance.fullName, newRepoInstance)
+    return newRepoInstance
   }
 
   // ---- contents / commit helpers ----
 
-  writeFile(repo: Repo, branch: string, path: string, data: Buffer | null, message: string, tsSec: number): { commit: string; blob: string | null } {
-    const segs = path.split('/').filter((s) => s.length > 0)
-    let blobSha: string | null = null
-    if (data !== null) blobSha = this.objects.store('blob', data)
-    const tip = repo.branchSha(branch)
-    const baseTree = tip ? this.commitTree(tip) : null
-    const entry = data === null ? null : { mode: '100644', sha: blobSha! }
-    const newTree = updateTreePath(this.objects, baseTree, segs, entry) ?? EMPTY_TREE
-    const commit = makeCommit(this.objects, {
-      tree: newTree,
-      parents: tip ? [tip] : [],
-      message,
-      tsSec,
+  writeFile(
+    repository: Repo,
+    targetBranch: string,
+    filePath: string,
+    fileBytes: Buffer | null,
+    commitLogMessage: string,
+    unixSeconds: number,
+  ): { commit: string; blob: string | null } {
+    const splitSegments = filePath.split('/').filter((seg) => seg.length > 0)
+    let createdBlobSha: string | null = null
+    if (fileBytes !== null) {
+      createdBlobSha = this.objects.store('blob', fileBytes)
+    }
+    const currentTip = repository.branchSha(targetBranch)
+    const rootTreeSha = currentTip ? this.commitTree(currentTip) : null
+    const entrySpec = fileBytes === null ? null : { mode: '100644', sha: createdBlobSha! }
+    const updatedTreeSha = updateTreePath(this.objects, rootTreeSha, splitSegments, entrySpec) ?? EMPTY_TREE
+    const synthesizedCommit = makeCommit(this.objects, {
+      tree: updatedTreeSha,
+      parents: currentTip ? [currentTip] : [],
+      message: commitLogMessage,
+      tsSec: unixSeconds,
     })
-    repo.setRef(`refs/heads/${branch}`, commit)
-    return { commit, blob: blobSha }
+    repository.setRef(`refs/heads/${targetBranch}`, synthesizedCommit)
+    return { commit: synthesizedCommit, blob: createdBlobSha }
   }
 
-  commitTree(commitSha: string): string {
-    const rec = this.objects.get(commitSha)
-    if (!rec) return EMPTY_TREE
-    const m = rec.data.toString('utf8').match(/^tree ([0-9a-f]{40})/m)
-    return m ? m[1] : EMPTY_TREE
+  commitTree(commitOid: string): string {
+    const commitObj = this.objects.get(commitOid)
+    if (!commitObj) return EMPTY_TREE
+    const match = commitObj.data.toString('utf8').match(/^tree ([0-9a-f]{40})/m)
+    return match ? match[1] : EMPTY_TREE
   }
 
-  fileAt(repo: Repo, branch: string, path: string): { mode: string; sha: string } | null {
-    const tip = repo.branchSha(branch)
-    if (!tip) return null
-    const tree = this.commitTree(tip)
-    const segs = path.split('/').filter((s) => s.length > 0)
-    let cur: TreeEntry | null = { mode: '40000', name: '', sha: tree }
-    for (let i = 0; i < segs.length; i++) {
-      if (!cur) return null
-      const rec = this.objects.get(cur.sha)
-      if (!rec) return null
-      const hit = parseTree(rec.data).find((e) => e.name === segs[i])
-      if (!hit) return null
-      if (i === segs.length - 1) return { mode: hit.mode, sha: hit.sha }
-      if (!isDirMode(hit.mode)) return null
-      cur = hit
+  fileAt(repository: Repo, branchName: string, targetPath: string): { mode: string; sha: string } | null {
+    const headTip = repository.branchSha(branchName)
+    if (!headTip) return null
+    const rootTree = this.commitTree(headTip)
+    const pathParts = targetPath.split('/').filter((p) => p.length > 0)
+    let currentLevel: TreeEntry | null = { mode: '40000', name: '', sha: rootTree }
+    for (let i = 0; i < pathParts.length; i++) {
+      if (!currentLevel) return null
+      const treeRec = this.objects.get(currentLevel.sha)
+      if (!treeRec) return null
+      const matchedEntry = parseTree(treeRec.data).find((e) => e.name === pathParts[i])
+      if (!matchedEntry) return null
+      if (i === pathParts.length - 1) return { mode: matchedEntry.mode, sha: matchedEntry.sha }
+      if (!isDirMode(matchedEntry.mode)) return null
+      currentLevel = matchedEntry
     }
-    return cur ? { mode: cur.mode, sha: cur.sha } : null
+    return currentLevel ? { mode: currentLevel.mode, sha: currentLevel.sha } : null
   }
 
-  listDir(repo: Repo, branch: string, path: string): Array<{ mode: string; name: string; sha: string; kind: 'file' | 'dir' }> {
-    const tip = repo.branchSha(branch)
-    if (!tip) return []
-    const tree = this.commitTree(tip)
-    const segs = path.split('/').filter((s) => s.length > 0)
-    let dirSha = tree
-    for (const seg of segs) {
-      const rec = this.objects.get(dirSha)
-      if (!rec) return []
-      const hit = parseTree(rec.data).find((e) => e.name === seg && isDirMode(e.mode))
-      if (!hit) return []
-      dirSha = hit.sha
+  listDir(repository: Repo, branchName: string, folderPath: string): Array<{ mode: string; name: string; sha: string; kind: 'file' | 'dir' }> {
+    const headTip = repository.branchSha(branchName)
+    if (!headTip) return []
+    const rootTree = this.commitTree(headTip)
+    const folderSegments = folderPath.split('/').filter((s) => s.length > 0)
+    let activeDirSha = rootTree
+    for (const folderSeg of folderSegments) {
+      const treeRec = this.objects.get(activeDirSha)
+      if (!treeRec) return []
+      const childDir = parseTree(treeRec.data).find((e) => e.name === folderSeg && isDirMode(e.mode))
+      if (!childDir) return []
+      activeDirSha = childDir.sha
     }
-    const rec = this.objects.get(dirSha)
-    if (!rec) return []
-    return parseTree(rec.data).map((e) => ({
-      mode: e.mode,
-      name: e.name,
-      sha: e.sha,
-      kind: isDirMode(e.mode) ? 'dir' : 'file',
+    const finalTree = this.objects.get(activeDirSha)
+    if (!finalTree) return []
+    return parseTree(finalTree.data).map((entry) => ({
+      mode: entry.mode,
+      name: entry.name,
+      sha: entry.sha,
+      kind: isDirMode(entry.mode) ? 'dir' : 'file',
     }))
   }
 
   // ---- merge helpers ----
 
   /** Squash-merge `pull`: tree from head, single parent = base tip, onto base branch. */
-  squashMerge(repo: Repo, pull: PullRec, message: string, tsSec: number): string {
-    const headTip = repo.branchSha(pull.headRef)
-    if (!headTip) throw new Error('head branch missing')
-    const tree = this.commitTree(headTip)
-    const baseTip = repo.branchSha(pull.baseRef) ?? ''
-    const commit = makeCommit(this.objects, { tree, parents: [baseTip], message, tsSec })
-    repo.setRef(`refs/heads/${pull.baseRef}`, commit)
-    return commit
+  squashMerge(repository: Repo, pullRequest: PullRec, mergeMsg: string, unixTimestamp: number): string {
+    const headCommit = repository.branchSha(pullRequest.headRef)
+    if (!headCommit) throw new Error('head branch missing')
+    const headTreeSha = this.commitTree(headCommit)
+    const baseCommit = repository.branchSha(pullRequest.baseRef) ?? ''
+    const mergedSha = makeCommit(this.objects, {
+      tree: headTreeSha,
+      parents: [baseCommit],
+      message: mergeMsg,
+      tsSec: unixTimestamp,
+    })
+    repository.setRef(`refs/heads/${pullRequest.baseRef}`, mergedSha)
+    return mergedSha
   }
 
-  changedPathsBetween(aTree: string | null, bTree: string | null): Map<string, { a: { mode: string; sha: string } | null; b: { mode: string; sha: string } | null }> {
-    const out = new Map<string, { a: { mode: string; sha: string } | null; b: { mode: string; sha: string } | null }>()
-    const put = (path: string, side: 'a' | 'b', v: { mode: string; sha: string } | null): void => {
-      const cur = out.get(path) ?? { a: null, b: null }
-      cur[side] = v
-      out.set(path, cur)
+  changedPathsBetween(
+    sourceTreeSha: string | null,
+    targetTreeSha: string | null,
+  ): Map<string, { a: { mode: string; sha: string } | null; b: { mode: string; sha: string } | null }> {
+    const pathMap = new Map<string, { a: { mode: string; sha: string } | null; b: { mode: string; sha: string } | null }>()
+    const recordFileSide = (fPath: string, branchSide: 'a' | 'b', entryVal: { mode: string; sha: string } | null): void => {
+      const existingRecord = pathMap.get(fPath) ?? { a: null, b: null }
+      existingRecord[branchSide] = entryVal
+      pathMap.set(fPath, existingRecord)
     }
-    if (aTree) for (const [p, v] of treeClosure(this.objects, aTree).blobs) put(p, 'a', v)
-    if (bTree) for (const [p, v] of treeClosure(this.objects, bTree).blobs) put(p, 'b', v)
-    return out
+    if (sourceTreeSha) {
+      for (const [blobPath, blobData] of treeClosure(this.objects, sourceTreeSha).blobs) {
+        recordFileSide(blobPath, 'a', blobData)
+      }
+    }
+    if (targetTreeSha) {
+      for (const [blobPath, blobData] of treeClosure(this.objects, targetTreeSha).blobs) {
+        recordFileSide(blobPath, 'b', blobData)
+      }
+    }
+    return pathMap
   }
 
   /** 3-way conflict check for a pull request. Returns true when conflicted. */
-  isConflicted(repo: Repo, pull: PullRec): boolean {
-    const headTip = repo.branchSha(pull.headRef)
-    const baseTip = repo.branchSha(pull.baseRef)
-    if (!headTip || !baseTip) return false
-    // common ancestor walk
-    const ancBase = new Set<string>([baseTip])
-    const q = [baseTip]
-    while (q.length) {
-      const c = q.shift()!
-      const rec = this.objects.get(c)
+  isConflicted(repository: Repo, pullRequest: PullRec): boolean {
+    const headCommitSha = repository.branchSha(pullRequest.headRef)
+    const baseCommitSha = repository.branchSha(pullRequest.baseRef)
+    if (!headCommitSha || !baseCommitSha) return false
+    const baseAncestorSet = new Set<string>([baseCommitSha])
+    const searchQueue = [baseCommitSha]
+    while (searchQueue.length) {
+      const currentOid = searchQueue.shift()!
+      const rec = this.objects.get(currentOid)
       if (!rec) continue
       for (const line of rec.data.toString('utf8').split('\n')) {
         if (line.startsWith('parent ')) {
           const p = line.slice(7).trim()
-          if (!ancBase.has(p)) {
-            ancBase.add(p)
-            q.push(p)
+          if (!baseAncestorSet.has(p)) {
+            baseAncestorSet.add(p)
+            searchQueue.push(p)
           }
         } else if (line === '') break
       }
     }
-    let mb: string | null = null
-    const seenH = new Set<string>([headTip])
-    const qh = [headTip]
-    while (qh.length) {
-      const c = qh.shift()!
-      if (ancBase.has(c)) {
-        mb = c
+    let commonBaseOid: string | null = null
+    const headVisited = new Set<string>([headCommitSha])
+    const headQueue = [headCommitSha]
+    while (headQueue.length) {
+      const curHeadOid = headQueue.shift()!
+      if (baseAncestorSet.has(curHeadOid)) {
+        commonBaseOid = curHeadOid
         break
       }
-      const rec = this.objects.get(c)
+      const rec = this.objects.get(curHeadOid)
       if (!rec) continue
       for (const line of rec.data.toString('utf8').split('\n')) {
         if (line.startsWith('parent ')) {
           const p = line.slice(7).trim()
-          if (!seenH.has(p)) {
-            seenH.add(p)
-            qh.push(p)
+          if (!headVisited.has(p)) {
+            headVisited.add(p)
+            headQueue.push(p)
           }
         } else if (line === '') break
       }
     }
-    const baseTree = this.commitTree(baseTip)
-    const headTree = this.commitTree(headTip)
-    const mbTree = mb ? this.commitTree(mb) : null
-    const diff = this.changedPathsBetween(mbTree, baseTree)
-    const headDiff = this.changedPathsBetween(mbTree, headTree)
-    for (const [path, hb] of headDiff) {
-      const bside = diff.get(path)
-      if (!bside) continue
-      const baseChanged = (bside.a?.sha ?? null) !== (bside.b?.sha ?? null)
-      const headChanged = (hb.a?.sha ?? null) !== (hb.b?.sha ?? null)
-      if (!baseChanged || !headChanged) continue
-      const baseVer = bside.b?.sha ?? null
-      const headVer = hb.b?.sha ?? null
-      if (baseVer !== headVer) return true
+    const baseTreeOid = this.commitTree(baseCommitSha)
+    const headTreeOid = this.commitTree(headCommitSha)
+    const commonTreeOid = commonBaseOid ? this.commitTree(commonBaseOid) : null
+    const baseDiff = this.changedPathsBetween(commonTreeOid, baseTreeOid)
+    const headDiff = this.changedPathsBetween(commonTreeOid, headTreeOid)
+    for (const [diffPath, headBlob] of headDiff) {
+      const baseBlob = baseDiff.get(diffPath)
+      if (!baseBlob) continue
+      const baseModified = (baseBlob.a?.sha ?? null) !== (baseBlob.b?.sha ?? null)
+      const headModified = (headBlob.a?.sha ?? null) !== (headBlob.b?.sha ?? null)
+      if (!baseModified || !headModified) continue
+      const baseVersionSha = baseBlob.b?.sha ?? null
+      const headVersionSha = headBlob.b?.sha ?? null
+      if (baseVersionSha !== headVersionSha) return true
     }
     return false
   }
 }
 
-export function storeObject(store: Store, type: ObjType, data: Buffer): string {
-  return store.objects.store(type, data)
+export function storeObject(targetStore: Store, objectKind: ObjType, binaryPayload: Buffer): string {
+  return targetStore.objects.store(objectKind, binaryPayload)
 }
 
-export function emptyTreeSha(store: Store): string {
-  if (!store.objects.has(EMPTY_TREE)) store.objects.store('tree', serializeTree([]))
+export function emptyTreeSha(targetStore: Store): string {
+  if (!targetStore.objects.has(EMPTY_TREE)) {
+    targetStore.objects.store('tree', serializeTree([]))
+  }
   return EMPTY_TREE
 }

@@ -1,4 +1,4 @@
-// Git object core: content-addressed store, commits, trees, tree writes, ancestry.
+// Core Git object storage, tree graph serialization, commit synthesis, and ancestry traversal.
 import { sha1, type ObjType } from './packfile.ts'
 
 export interface ObjRec {
@@ -7,21 +7,23 @@ export interface ObjRec {
 }
 
 export class ObjectStore {
-  map = new Map<string, ObjRec>()
-  treeMemo = new Map<string, { blobs: Map<string, { mode: string; sha: string }>; trees: Set<string> }>()
+  readonly map = new Map<string, ObjRec>()
+  readonly treeMemo = new Map<string, { blobs: Map<string, { mode: string; sha: string }>; trees: Set<string> }>()
 
-  store(type: ObjType, data: Buffer): string {
-    const sha = sha1(type, data)
-    if (!this.map.has(sha)) this.map.set(sha, { type, data })
-    return sha
+  store(objType: ObjType, rawBytes: Buffer): string {
+    const objectHash = sha1(objType, rawBytes)
+    if (!this.map.has(objectHash)) {
+      this.map.set(objectHash, { type: objType, data: rawBytes })
+    }
+    return objectHash
   }
 
-  get(sha: string): ObjRec | undefined {
-    return this.map.get(sha)
+  get(hash: string): ObjRec | undefined {
+    return this.map.get(hash)
   }
 
-  has(sha: string): boolean {
-    return this.map.has(sha)
+  has(hash: string): boolean {
+    return this.map.has(hash)
   }
 }
 
@@ -35,22 +37,33 @@ export interface CommitRec {
   message: string
 }
 
-export function parseCommit(data: Buffer): CommitRec {
-  const text = data.toString('utf8')
-  const idx = text.indexOf('\n\n')
-  const head = idx === -1 ? text : text.slice(0, idx)
-  const message = idx === -1 ? '' : text.slice(idx + 2)
-  let tree = ''
-  const parents: string[] = []
-  let author = ''
-  let committer = ''
-  for (const line of head.split('\n')) {
-    if (line.startsWith('tree ')) tree = line.slice(5).trim()
-    else if (line.startsWith('parent ')) parents.push(line.slice(7).trim())
-    else if (line.startsWith('author ')) author = line.slice(7)
-    else if (line.startsWith('committer ')) committer = line.slice(10)
+export function parseCommit(commitBytes: Buffer): CommitRec {
+  const fullText = commitBytes.toString('utf8')
+  const splitPoint = fullText.indexOf('\n\n')
+  const headerSection = splitPoint === -1 ? fullText : fullText.slice(0, splitPoint)
+  const commitMsg = splitPoint === -1 ? '' : fullText.slice(splitPoint + 2)
+  let treeOid = ''
+  const parentOids: string[] = []
+  let authorSig = ''
+  let committerSig = ''
+  for (const rawLine of headerSection.split('\n')) {
+    if (rawLine.startsWith('tree ')) {
+      treeOid = rawLine.slice(5).trim()
+    } else if (rawLine.startsWith('parent ')) {
+      parentOids.push(rawLine.slice(7).trim())
+    } else if (rawLine.startsWith('author ')) {
+      authorSig = rawLine.slice(7)
+    } else if (rawLine.startsWith('committer ')) {
+      committerSig = rawLine.slice(10)
+    }
   }
-  return { tree, parents, author, committer, message }
+  return {
+    tree: treeOid,
+    parents: parentOids,
+    author: authorSig,
+    committer: committerSig,
+    message: commitMsg,
+  }
 }
 
 export interface TreeEntry {
@@ -59,77 +72,81 @@ export interface TreeEntry {
   sha: string
 }
 
-export function isDirMode(mode: string): boolean {
-  return mode === '40000' || mode === '040000'
+export function isDirMode(entryMode: string): boolean {
+  return entryMode === '40000' || entryMode === '040000'
 }
 
-export function parseTree(data: Buffer): TreeEntry[] {
-  const out: TreeEntry[] = []
-  let p = 0
-  while (p < data.length) {
-    const sp = data.indexOf(32, p)
-    const nul = data.indexOf(0, sp)
-    if (sp === -1 || nul === -1 || nul + 21 > data.length) break
-    const mode = data.toString('latin1', p, sp)
-    const name = data.toString('utf8', sp + 1, nul)
-    const sha = data.toString('hex', nul + 1, nul + 21)
-    out.push({ mode, name, sha })
-    p = nul + 21
+export function parseTree(treeBuffer: Buffer): TreeEntry[] {
+  const parsedEntries: TreeEntry[] = []
+  let cursor = 0
+  while (cursor < treeBuffer.length) {
+    const spaceOffset = treeBuffer.indexOf(32, cursor)
+    const nullOffset = treeBuffer.indexOf(0, spaceOffset)
+    if (spaceOffset === -1 || nullOffset === -1 || nullOffset + 21 > treeBuffer.length) {
+      break
+    }
+    const itemMode = treeBuffer.toString('latin1', cursor, spaceOffset)
+    const itemName = treeBuffer.toString('utf8', spaceOffset + 1, nullOffset)
+    const itemSha = treeBuffer.toString('hex', nullOffset + 1, nullOffset + 21)
+    parsedEntries.push({ mode: itemMode, name: itemName, sha: itemSha })
+    cursor = nullOffset + 21
   }
-  return out
+  return parsedEntries
 }
 
-export function serializeTree(entries: TreeEntry[]): Buffer {
-  const sorted = [...entries].sort((a, b) => {
-    const an = a.name + (isDirMode(a.mode) ? '/' : '')
-    const bn = b.name + (isDirMode(b.mode) ? '/' : '')
-    return an < bn ? -1 : an > bn ? 1 : 0
+export function serializeTree(treeItems: TreeEntry[]): Buffer {
+  const ordered = [...treeItems].sort((left, right) => {
+    const leftPath = left.name + (isDirMode(left.mode) ? '/' : '')
+    const rightPath = right.name + (isDirMode(right.mode) ? '/' : '')
+    return leftPath < rightPath ? -1 : leftPath > rightPath ? 1 : 0
   })
-  const parts: Buffer[] = []
-  for (const e of sorted) {
-    parts.push(Buffer.from(`${e.mode} ${e.name}\0`, 'utf8'))
-    parts.push(Buffer.from(e.sha, 'hex'))
+  const chunks: Buffer[] = []
+  for (const item of ordered) {
+    chunks.push(Buffer.from(`${item.mode} ${item.name}\0`, 'utf8'))
+    chunks.push(Buffer.from(item.sha, 'hex'))
   }
-  return Buffer.concat(parts)
+  return Buffer.concat(chunks)
 }
 
 export function makeCommit(
-  objects: ObjectStore,
-  opts: { tree: string; parents: string[]; message: string; tsSec: number; who?: string },
+  storage: ObjectStore,
+  params: { tree: string; parents: string[]; message: string; tsSec: number; who?: string },
 ): string {
-  const ident = `${opts.who ?? 'Forge <forge@forge.local>'} ${opts.tsSec} +0000`
-  const lines = [`tree ${opts.tree}`]
-  for (const p of opts.parents) lines.push(`parent ${p}`)
-  lines.push(`author ${ident}`, `committer ${ident}`, '', opts.message, '')
-  return objects.store('commit', Buffer.from(lines.join('\n'), 'utf8'))
+  const authorIdentity = `${params.who ?? 'Forge <forge@forge.local>'} ${params.tsSec} +0000`
+  const commitLines = [`tree ${params.tree}`]
+  for (const parentSha of params.parents) {
+    commitLines.push(`parent ${parentSha}`)
+  }
+  commitLines.push(`author ${authorIdentity}`, `committer ${authorIdentity}`, '', params.message, '')
+  return storage.store('commit', Buffer.from(commitLines.join('\n'), 'utf8'))
 }
 
 /** Full recursive closure of a tree: blob paths + all tree shas (memoized). */
-export function treeClosure(objects: ObjectStore, treeSha: string): {
+export function treeClosure(storage: ObjectStore, rootTreeSha: string): {
   blobs: Map<string, { mode: string; sha: string }>
   trees: Set<string>
 } {
-  const memo = objects.treeMemo
-  const hit = memo.get(treeSha)
-  if (hit) return hit
-  const blobs = new Map<string, { mode: string; sha: string }>()
-  const trees = new Set<string>([treeSha])
-  const walk = (sha: string, prefix: string): void => {
-    const rec = objects.get(sha)
-    if (!rec) return
-    for (const e of parseTree(rec.data)) {
-      if (isDirMode(e.mode)) {
-        trees.add(e.sha)
-        walk(e.sha, prefix + e.name + '/')
+  const cache = storage.treeMemo
+  const existing = cache.get(rootTreeSha)
+  if (existing) return existing
+  const collectedBlobs = new Map<string, { mode: string; sha: string }>()
+  const collectedTrees = new Set<string>([rootTreeSha])
+  const traverse = (currentSha: string, currentPrefix: string): void => {
+    const itemRecord = storage.get(currentSha)
+    if (!itemRecord) return
+    for (const treeElem of parseTree(itemRecord.data)) {
+      if (isDirMode(treeElem.mode)) {
+        collectedTrees.add(treeElem.sha)
+        traverse(treeElem.sha, currentPrefix + treeElem.name + '/')
       } else {
-        blobs.set(prefix + e.name, { mode: e.mode, sha: e.sha })
+        collectedBlobs.set(currentPrefix + treeElem.name, { mode: treeElem.mode, sha: treeElem.sha })
       }
     }
   }
-  walk(treeSha, '')
-  const rec = { blobs, trees }
-  memo.set(treeSha, rec)
-  return rec
+  traverse(rootTreeSha, '')
+  const closureResult = { blobs: collectedBlobs, trees: collectedTrees }
+  cache.set(rootTreeSha, closureResult)
+  return closureResult
 }
 
 /**
@@ -137,95 +154,103 @@ export function treeClosure(objects: ObjectStore, treeSha: string): {
  * sha of this level, or null when this level becomes empty (callers drop it).
  */
 export function updateTreePath(
-  objects: ObjectStore,
-  treeSha: string | null,
-  segs: string[],
-  entry: { mode: string; sha: string } | null,
+  storage: ObjectStore,
+  currentTreeSha: string | null,
+  pathSegments: string[],
+  leafEntry: { mode: string; sha: string } | null,
 ): string | null {
-  const rec = treeSha ? objects.get(treeSha) : undefined
-  const entries = rec ? parseTree(rec.data) : []
-  const name = segs[0]
-  if (segs.length === 1) {
-    const rest = entries.filter((e) => e.name !== name)
-    if (entry) rest.push({ mode: entry.mode, name, sha: entry.sha })
-    return objects.store('tree', serializeTree(rest))
+  const record = currentTreeSha ? storage.get(currentTreeSha) : undefined
+  const existingList = record ? parseTree(record.data) : []
+  const headSegment = pathSegments[0]
+  if (pathSegments.length === 1) {
+    const filtered = existingList.filter((elem) => elem.name !== headSegment)
+    if (leafEntry) {
+      filtered.push({ mode: leafEntry.mode, name: headSegment, sha: leafEntry.sha })
+    }
+    return storage.store('tree', serializeTree(filtered))
   }
-  const cur = entries.find((e) => e.name === name && isDirMode(e.mode))
-  const newSub = updateTreePath(objects, cur ? cur.sha : null, segs.slice(1), entry)
-  const rest = entries.filter((e) => e.name !== name)
-  if (newSub !== null) rest.push({ mode: '40000', name, sha: newSub })
-  return objects.store('tree', serializeTree(rest))
+  const childSubtree = existingList.find((elem) => elem.name === headSegment && isDirMode(elem.mode))
+  const updatedChildSha = updateTreePath(storage, childSubtree ? childSubtree.sha : null, pathSegments.slice(1), leafEntry)
+  const remaining = existingList.filter((elem) => elem.name !== headSegment)
+  if (updatedChildSha !== null) {
+    remaining.push({ mode: '40000', name: headSegment, sha: updatedChildSha })
+  }
+  return storage.store('tree', serializeTree(remaining))
 }
 
 /** Walk a tree path to a blob entry. */
-export function lookupPath(objects: ObjectStore, treeSha: string | null, segs: string[]): { mode: string; sha: string } | null {
-  let cur: TreeEntry | null = treeSha ? { mode: '40000', name: '', sha: treeSha } : null
-  for (let i = 0; i < segs.length; i++) {
-    if (!cur) return null
-    const rec = objects.get(cur.sha)
-    if (!rec) return null
-    const entries = parseTree(rec.data)
-    const hit = entries.find((e) => e.name === segs[i]) ?? null
-    if (!hit) return null
-    if (i === segs.length - 1) return { mode: hit.mode, sha: hit.sha }
-    if (!isDirMode(hit.mode)) return null
-    cur = hit
+export function lookupPath(
+  storage: ObjectStore,
+  initialTreeSha: string | null,
+  segments: string[],
+): { mode: string; sha: string } | null {
+  let activeEntry: TreeEntry | null = initialTreeSha ? { mode: '40000', name: '', sha: initialTreeSha } : null
+  for (let idx = 0; idx < segments.length; idx++) {
+    if (!activeEntry) return null
+    const record = storage.get(activeEntry.sha)
+    if (!record) return null
+    const entries = parseTree(record.data)
+    const match = entries.find((elem) => elem.name === segments[idx]) ?? null
+    if (!match) return null
+    if (idx === segments.length - 1) return { mode: match.mode, sha: match.sha }
+    if (!isDirMode(match.mode)) return null
+    activeEntry = match
   }
-  return cur ? { mode: cur.mode, sha: cur.sha } : null
+  return activeEntry ? { mode: activeEntry.mode, sha: activeEntry.sha } : null
 }
 
-/** All ancestor commit shas of `sha` (inclusive), BFS with cap. */
-export function ancestors(objects: ObjectStore, sha: string, cap = 20000): Set<string> {
-  const seen = new Set<string>()
-  const queue = [sha]
-  seen.add(sha)
-  while (queue.length && seen.size < cap) {
-    const c = queue.shift()!
-    const rec = objects.get(c)
+/** All ancestor commit shas of `targetSha` (inclusive), BFS with cap. */
+export function ancestors(storage: ObjectStore, targetSha: string, maxCap = 20000): Set<string> {
+  const visitedSet = new Set<string>()
+  const pendingQueue = [targetSha]
+  visitedSet.add(targetSha)
+  while (pendingQueue.length && visitedSet.size < maxCap) {
+    const commitId = pendingQueue.shift()!
+    const rec = storage.get(commitId)
     if (!rec) continue
-    const commit = parseCommit(rec.data)
-    for (const p of commit.parents) {
-      if (!seen.has(p)) {
-        seen.add(p)
-        queue.push(p)
+    const parsed = parseCommit(rec.data)
+    for (const pSha of parsed.parents) {
+      if (!visitedSet.has(pSha)) {
+        visitedSet.add(pSha)
+        pendingQueue.push(pSha)
       }
     }
   }
-  return seen
+  return visitedSet
 }
 
-export function isAncestor(objects: ObjectStore, oldSha: string, newSha: string): boolean {
-  if (oldSha === newSha) return true
-  const seen = new Set<string>([newSha])
-  const queue = [newSha]
-  while (queue.length) {
-    const c = queue.shift()!
-    if (c === oldSha) return true
-    const rec = objects.get(c)
+export function isAncestor(storage: ObjectStore, ancestorCandidate: string, descendantSha: string): boolean {
+  if (ancestorCandidate === descendantSha) return true
+  const visited = new Set<string>([descendantSha])
+  const searchQueue = [descendantSha]
+  while (searchQueue.length) {
+    const currentSha = searchQueue.shift()!
+    if (currentSha === ancestorCandidate) return true
+    const rec = storage.get(currentSha)
     if (!rec) continue
-    for (const p of parseCommit(rec.data).parents) {
-      if (!seen.has(p)) {
-        seen.add(p)
-        queue.push(p)
+    for (const parentId of parseCommit(rec.data).parents) {
+      if (!visited.has(parentId)) {
+        visited.add(parentId)
+        searchQueue.push(parentId)
       }
     }
   }
   return false
 }
 
-export function mergeBase(objects: ObjectStore, a: string, b: string): string | null {
-  const ancA = ancestors(objects, a)
-  const seen = new Set<string>([b])
-  const queue = [b]
-  while (queue.length) {
-    const c = queue.shift()!
-    if (ancA.has(c)) return c
-    const rec = objects.get(c)
+export function mergeBase(storage: ObjectStore, commitAlpha: string, commitBeta: string): string | null {
+  const alphaAncestors = ancestors(storage, commitAlpha)
+  const visitedBeta = new Set<string>([commitBeta])
+  const betaQueue = [commitBeta]
+  while (betaQueue.length) {
+    const currentBetaSha = betaQueue.shift()!
+    if (alphaAncestors.has(currentBetaSha)) return currentBetaSha
+    const rec = storage.get(currentBetaSha)
     if (!rec) continue
     for (const p of parseCommit(rec.data).parents) {
-      if (!seen.has(p)) {
-        seen.add(p)
-        queue.push(p)
+      if (!visitedBeta.has(p)) {
+        visitedBeta.add(p)
+        betaQueue.push(p)
       }
     }
   }
